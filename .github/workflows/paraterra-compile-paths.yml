@@ -1,0 +1,60 @@
+name: compile paths
+on:
+  workflow_call:
+    inputs:
+      ENV:
+        description: dev, staging, prod
+        required: true
+        type: string
+      EXCLUDE_ACCOUNTS:
+        description: comma delimited list of accounts to exclude
+        required: false
+        type: string
+    outputs:
+      tfvars_paths: 
+        value: ${{ jobs.compile-tfvars-paths.outputs.tfvars_paths }}
+
+##
+# The intent of the concurrency statement is as follows:
+#
+#   1. Allow concurrent operations on VPCs in different Orgs
+#
+##
+
+concurrency:
+  group: ${{ inputs.ENV }}
+  cancel-in-progress: false
+
+env:
+  ENV: ${{ inputs.ENV }}
+  EXCLUDE_ACCOUNTS: ${{ inputs.EXCLUDE_ACCOUNTS }}
+
+jobs:
+  compile-tfvars-paths:
+    outputs:
+      tfvars_paths: ${{ steps.compile_tfvars_paths.outputs.tfvars_paths }}
+      SAML_PROFILE: ${{ steps.compile_tfvars_paths.outputs.SAML_PROFILE }}
+    steps:
+      - name: setup build environment
+        shell: bash {0}
+        env:
+           DEBIAN_FRONTEND: 'noninteractive'
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install uuid-runtime
+          sudo apt-get -y upgrade python3
+          python3 --version
+
+      - name: "checkout"
+        uses: actions/checkout@v3
+
+      - name: "compile tfvars paths"
+        id: compile_tfvars_paths
+        run: |
+          pip3 install --editable .
+          flags=""
+          if [[ -n "$EXCLUDE_ACCOUNTS" ]]; then flags=$flags"--exclude-accounts $EXCLUDE_ACCOUNTS "; fi
+          tfvars_paths=$(paraterra compile-paths --org $ORG --env $ENV --shortened $flags)
+          echo $tfvars_paths
+          echo "tfvars_paths=$tfvars_paths" >> "$GITHUB_OUTPUT"
+          echo "SAML_PROFILE=$ORG-master" >> "$GITHUB_OUTPUT"

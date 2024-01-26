@@ -1,0 +1,139 @@
+name: terraform download apply
+on:
+  workflow_call:
+    inputs:
+      TFVARS_PATH:
+        description: path to tfvars file from main tf code dir of form 'accounts/{account}/{region}/{uuid}'
+        required: true
+        type: string
+      ENV:
+        description: dev, test, uat, research, prod
+        required: true
+        type: string
+      SAML_PROFILE:
+        default: "alpha-master"
+        description: Login Profile corresponding to AWS Org of Account
+        required: true
+        type: string
+    secrets:
+      ORG_SERVICE_ACCOUNT_PASSWORD:
+        required: true
+
+##
+# The intent of the concurrency statement is as follows:
+#
+#   1. Allow concurrent create operations on stacks in different accounts or regions
+#
+##
+
+concurrency:
+  group: ${{ inputs.TFVARS_PATH }}
+  cancel-in-progress: false
+
+env:
+  TFVARS_PATH: ${{ inputs.TFVARS_PATH }}
+  ENV: ${{ inputs.ENV }}
+  SAML_PROFILE: ${{ inputs.SAML_PROFILE }}
+  PROFILE_WITH_ASSUMED_ROLE: cicd-terraform
+  TF_CODE_DIR: src/infra/terraform/networking-dedicated-spoke
+  UTILS_DIR: src/app/dedicatedVpcImport/utils
+  
+
+jobs:
+  download-and-apply:
+    name: apply-${{ inputs.TFVARS_PATH }}
+    environment: manual-approval
+    outputs:
+      ACCOUNT: ${{ steps.pull-out-inputs.outputs.ACCOUNT }}
+      REGION: ${{ steps.pull-out-inputs.outputs.REGION }}
+      UUID: ${{ steps.pull-out-inputs.outputs.UUID }}
+    steps:
+      - name: "Print Inputs"
+        run: |
+          echo TFVARS_PATH: ${{ inputs.TFVARS_PATH }}
+          echo SAML_PROFILE: ${{ inputs.SAML_PROFILE }}
+
+      - name: setup build environment
+        shell: bash {0}
+        env:
+           DEBIAN_FRONTEND: 'noninteractive'
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install uuid-runtime
+
+      - name: pull out inputs for terraform-update-dispatch
+        id: pull-out-inputs
+        run: |
+          IFS='/' read -ra tfvars_arr <<< "$TFVARS_PATH"
+          ACCOUNT=${tfvars_arr[1]}
+          REGION=${tfvars_arr[2]}
+          UUID=${tfvars_arr[3]}
+
+          echo "ACCOUNT=$ACCOUNT"
+          echo "REGION=$REGION"
+          echo "UUID=$UUID"
+          
+          echo "ACCOUNT=$ACCOUNT" >> "$GITHUB_OUTPUT"
+          echo "REGION=$REGION" >> "$GITHUB_OUTPUT"
+          echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
+          echo "PREFIX=$ACCOUNT+$REGION+$UUID" >> "$GITHUB_OUTPUT"
+
+      - name: "Checkout"
+        uses: actions/checkout@v3
+
+      - name: download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ inputs.ENV }}-terraform-plan-out
+          path: artifacts/${{ inputs.ENV }}-terraform-plan-out
+
+      - name: "! saml2aws login"
+        run: ./ci-cd/setup.sh
+        env:
+          PROFILE: ${{ inputs.SAML_PROFILE }}
+          SERVICE_ACCOUNT_PASSWORD: ${{ secrets.ORG_SERVICE_ACCOUNT_PASSWORD }}
+        shell: bash
+
+      - name: "Assume role"
+        env:
+          AWS_DEFAULT_REGION: ${{ steps.pull-out-inputs.outputs.REGION }}
+          AWS_PROFILE: ${{ inputs.SAML_PROFILE }}
+        run: |
+          pip3 install -r $UTILS_DIR/requirements.txt
+          python3 $UTILS_DIR/assume_role.py --account ${{ steps.pull-out-inputs.outputs.ACCOUNT }} --profile $PROFILE_WITH_ASSUMED_ROLE --assumed-role hccp-CICDAutomationRole
+        shell: bash
+
+      - name: "Install terraform"
+        shell: bash
+        run: ./ci-cd/install-terraform.sh
+
+      - name: "Generate backend"
+        env:
+          AWS_PROFILE: ${{ env.PROFILE_WITH_ASSUMED_ROLE }}
+          REGION: ${{ steps.pull-out-inputs.outputs.REGION }}
+          TFVARS_PATH: ${{ env.TFVARS_PATH }}
+          STATE_TF_PATH: ./${{ env.TF_CODE_DIR }}/state.tf
+        shell: bash {0}
+        run: ./ci-cd/generate-backend.sh
+
+      - name: "terraform init"
+        env:
+          AWS_PROFILE: ${{ env.PROFILE_WITH_ASSUMED_ROLE }}
+        shell: bash
+        run: |
+          cd $TF_CODE_DIR
+
+          terraform init
+      
+      - name: terraform apply
+        env:
+          AWS_PROFILE:  ${{ env.PROFILE_WITH_ASSUMED_ROLE }}
+          AWS_DEFAULT_REGION: ${{ steps.pull-out-inputs.outputs.REGION }}
+          PREFIX: ${{ steps.pull-out-inputs.outputs.PREFIX }}
+        shell: bash
+        run: |
+          cp artifacts/${{ inputs.ENV }}-terraform-plan-out/$PREFIX+terraform-plan.out $TF_CODE_DIR
+          cd $TF_CODE_DIR
+          aws sts get-caller-identity
+          
+          terraform apply -auto-approve $PREFIX+terraform-plan.out

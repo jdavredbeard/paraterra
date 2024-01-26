@@ -1,0 +1,115 @@
+name: terraform update matrix
+on:
+  workflow_dispatch:
+    inputs:
+      ENV:
+        description: dev, test, research, uat, prod
+        required: true
+        type: choice
+        options: [dev, test, research, uat, prod]
+      ORG:
+        description: alpha or main
+        required: true
+        type: choice
+        options: [alpha, main]
+      EXCLUDE_ACCOUNTS:
+        description: comma delimited list of account ids to exclude
+        required: false
+        type: string
+      NO_CREATES:
+        description: enforce no resource creations in plan
+        type: boolean
+      NO_DELETES:
+        description: enforce no resource deletions in plan
+        type: boolean
+      NO_DRIFT:
+        description: enforce no drift in plan
+        type: boolean
+      ALLOWED_PROPS:
+        description: comma delimited list of resource props allowed to change for any resource
+        required: false
+        type: string
+
+##
+# The intent of the concurrency statement is as follows:
+#
+#   1. Allow concurrent operations on VPCs in different Orgs
+#
+##
+
+concurrency:
+  group: ${{ inputs.ENV }}
+  cancel-in-progress: false
+
+jobs:
+  paraterra-compile-paths:
+    uses: ./.github/workflows/paraterra-compile-paths.yml
+    with:
+      ENV: ${{ inputs.ENV }}
+      ORG: ${{ inputs.ORG }}
+      EXCLUDE_ACCOUNTS: ${{ inputs.EXCLUDE_ACCOUNTS }}
+
+  terraform-plan-upload:
+    name: terraform-plan-upload
+    needs: [paraterra-compile-paths]
+    if: needs.paraterra-compile-paths.outputs.tfvars_paths != '[]'
+    uses: ./.github/workflows/terraform-plan-upload.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        tfvars_path: ${{ fromJSON(needs.paraterra-compile-paths.outputs.tfvars_paths) }}
+    with:
+      TFVARS_PATH: ${{ matrix.tfvars_path }}
+      ENV: ${{ inputs.ENV }}
+      SAML_PROFILE: ${{ inputs.ORG }}-master
+    secrets: inherit
+  
+  paraterra-parse-plans:
+    needs: [terraform-plan-upload]
+    outputs:
+      plan_output_files: ${{ steps.parse-plans.outputs.plan_output_files }}
+    steps: 
+      - name: "checkout"
+        uses: actions/checkout@v3
+      - name: mkdir artifacts
+        run: mkdir artifacts
+      - name: download json artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ inputs.ENV }}-terraform-plan-out-json
+          path: artifacts/${{ inputs.ENV }}-terraform-plan-out-json
+      - name: download binary artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ inputs.ENV }}-terraform-plan-out
+          path: artifacts/${{ inputs.ENV }}-terraform-plan-out
+      - name: parse-plans
+        id: parse-plans
+        run: |
+          flags=""
+          if [ "$NO_CREATES" = "true" ]; then flags=$flags"--no-creates "; fi
+          if [ "$NO_DELETES" = "true" ]; then flags=$flags"--no-deletes "; fi
+          if [ "$NO_DRIFT" = "true" ]; then flags=$flags"--no-drift "; fi
+          if [[ -n "$ALLOWED_PROPS" ]]; then flags=$flags"--allowed-props $ALLOWED_PROPS "; fi
+          echo "$flags"
+          pip3 install --editable .
+          paraterra parse-plans $flags --artifacts-path artifacts/${{ inputs.ENV }}-terraform-plan-out-json
+          plan_output_files=$(paraterra print-plan-files --artifacts-path artifacts/${{ inputs.ENV }}-terraform-plan-out)
+          echo "plan_output_files=$plan_output_files" >> "$GITHUB_OUTPUT"
+
+  terraform-download-apply:
+    name: terraform-download-apply
+    needs: [paraterra-parse-plans]
+    uses: ./.github/workflows/terraform-download-apply.yml
+    strategy:
+      fail-fast: false
+      matrix:
+        tfvars_path: ${{ fromJSON(needs.paraterra-compile-paths.outputs.tfvars_paths) }}
+    with:
+      TFVARS_PATH: ${{ matrix.tfvars_path }}
+      ENV: ${{ inputs.ENV }}
+      SAML_PROFILE: ${{ inputs.ORG }}-master
+    secrets: inherit
+     
+
+    

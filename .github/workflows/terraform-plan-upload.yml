@@ -1,0 +1,143 @@
+name: terraform plan upload
+on:
+  workflow_call:
+    inputs:
+      TFVARS_PATH:
+        description: path to tfvars file from main tf code dir of form 'accounts/{account}/{region}/{uuid}'
+        required: true
+        type: string
+      ENV:
+        description: dev, test, uat, research, prod
+        required: true
+        type: string
+      SAML_PROFILE:
+        default: "alpha-master"
+        description: Login Profile corresponding to AWS Org of Account
+        required: true
+        type: string
+    secrets:
+      ORG_SERVICE_ACCOUNT_PASSWORD:
+        required: true
+
+##
+# The intent of the concurrency statement is as follows:
+#
+#   1. Allow concurrent create operations on stacks in different accounts or regions
+#   2. Allow the create operations to run concurrently with delete and update operations
+#
+##
+
+concurrency:
+  group: ${{ inputs.TFVARS_PATH }}
+  cancel-in-progress: false
+
+env:
+  TFVARS_PATH: ${{ inputs.TFVARS_PATH }}
+  ENV: ${{ inputs.ENV }}
+  SAML_PROFILE: ${{ inputs.SAML_PROFILE }}
+  PROFILE_WITH_ASSUMED_ROLE: cicd-terraform
+  TF_CODE_DIR: src/infra/terraform/networking-dedicated-spoke
+  UTILS_DIR: src/app/dedicatedVpcImport/utils
+  
+
+jobs:
+  plan-and-upload:
+    name: plan-${{ inputs.tfvars_path }}
+    outputs:
+      ACCOUNT: ${{ steps.pull-out-inputs.outputs.ACCOUNT }}
+      REGION: ${{ steps.pull-out-inputs.outputs.REGION }}
+      UUID: ${{ steps.pull-out-inputs.outputs.UUID }}
+    steps:
+      - name: "Print Inputs"
+        run: |
+          echo TFVARS_PATH: ${{ inputs.TFVARS_PATH }}
+          echo ENV: ${{ inputs.ENV }}
+          echo SAML_PROFILE: ${{ inputs.SAML_PROFILE }}
+
+      - name: setup build environment
+        shell: bash {0}
+        env:
+           DEBIAN_FRONTEND: 'noninteractive'
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install uuid-runtime
+
+      - name: pull out inputs for terraform-update-dispatch
+        id: pull-out-inputs
+        run: |
+          IFS='/' read -ra tfvars_arr <<< "$TFVARS_PATH"
+          ACCOUNT=${tfvars_arr[1]}
+          REGION=${tfvars_arr[2]}
+          UUID=${tfvars_arr[3]}
+
+          echo "ACCOUNT=$ACCOUNT"
+          echo "REGION=$REGION"
+          echo "UUID=$UUID"
+          
+          echo "ACCOUNT=$ACCOUNT" >> "$GITHUB_OUTPUT"
+          echo "REGION=$REGION" >> "$GITHUB_OUTPUT"
+          echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
+          echo "PREFIX=$ACCOUNT+$REGION+$UUID" >> "$GITHUB_OUTPUT"
+
+      - name: "Checkout"
+        uses: actions/checkout@v3
+
+      - name: "Assume role"
+        env:
+          AWS_DEFAULT_REGION: ${{ steps.pull-out-inputs.outputs.REGION }}
+          AWS_PROFILE: ${{ inputs.SAML_PROFILE }}
+        run: |
+          pip3 install -r $UTILS_DIR/requirements.txt
+          python3 $UTILS_DIR/assume_role.py --account ${{ steps.pull-out-inputs.outputs.ACCOUNT }} --profile $PROFILE_WITH_ASSUMED_ROLE --assumed-role hccp-CICDAutomationRole
+        shell: bash
+
+      - name: "Install terraform"
+        shell: bash
+        run: ./ci-cd/install-terraform.sh
+
+      - name: "Generate backend"
+        env:
+          AWS_PROFILE: ${{ env.PROFILE_WITH_ASSUMED_ROLE }}
+          TFVARS_PATH: ${{ inputs.TFVARS_PATH }}
+          REGION: ${{ steps.pull-out-inputs.outputs.REGION }}
+          STATE_TF_PATH: ./${{ env.TF_CODE_DIR }}/state.tf
+        shell: bash {0}
+        run: ./ci-cd/generate-backend.sh
+
+      - name: "terraform init"
+        env:
+          AWS_PROFILE: ${{ env.PROFILE_WITH_ASSUMED_ROLE }}
+        shell: bash
+        run: |
+          cd $TF_CODE_DIR
+
+          terraform init
+
+      - name: "terraform plan"
+        env:
+          AWS_PROFILE: ${{ env.PROFILE_WITH_ASSUMED_ROLE }}
+          PREFIX: ${{ steps.pull-out-inputs.outputs.PREFIX }}
+        shell: bash
+        run: |
+          cd $TF_CODE_DIR
+          terraform plan -no-color \
+          -var-file=../dedicatedVpcImport-tfvars/$TFVARS_PATH/terraform.tfvars.json \
+          -out "${PREFIX}+terraform-plan.out" \
+          | tee "${PREFIX}+terraform-plan.txt"
+
+          terraform show -json "${PREFIX}+terraform-plan.out" | tee "${PREFIX}+terraform-plan-out.json"
+      - name: upload terraform-plan-out.json
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ inputs.ENV }}-terraform-plan-out-json
+          path: "${{ env.TF_CODE_DIR }}/${{ steps.pull-out-inputs.outputs.PREFIX }}+terraform-plan-out.json"
+      - name: upload terraform-plan.txt
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ inputs.ENV }}-terraform-plan-txt
+          path: "${{ env.TF_CODE_DIR }}/${{ steps.pull-out-inputs.outputs.PREFIX }}+terraform-plan.txt"
+      - name: upload terraform-plan.out
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ inputs.ENV }}-terraform-plan-out
+          path: "${{ env.TF_CODE_DIR }}/${{ steps.pull-out-inputs.outputs.PREFIX }}+terraform-plan.out"

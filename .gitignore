@@ -1,0 +1,6 @@
+__pycache__
+ndst.egg-info
+.env
+.venv/**
+accounts
+generated_files
