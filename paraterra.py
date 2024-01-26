@@ -233,7 +233,7 @@ def _update_or_delete(field_name, field_details, dict_location):
     else:
         dict_location[field_name] = field_details['value']
 
-@cli.command()
+@cli.command(help="")
 @click.option('--no-deletes', is_flag=True, required=False, help="Fails pipeline if changes include deletes")
 @click.option('--no-creates', is_flag=True, required=False, help="Fails pipeline if changes include creates")
 @click.option('--no-drift', is_flag=True, required=False, help="Fails pipeline if changes include drift")
